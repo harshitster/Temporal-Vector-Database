@@ -170,9 +170,8 @@ class WikipediaSimulator:
                 days_ahead = decay_factor * time_span_days + np.random.normal(
                     0, time_span_days * 0.05
                 )
-                days_ahead = (
-                    max(timestamps[-1].timestamp() - start_date.timestamp()) / 86400 + 1
-                )
+                min_days_ahead = (timestamps[-1] - start_date).days + 1
+                days_ahead = max(days_ahead, min_days_ahead)
                 days_ahead = min(time_span_days, days_ahead)
                 timestamps.append(start_date + timedelta(days=days_ahead))
 

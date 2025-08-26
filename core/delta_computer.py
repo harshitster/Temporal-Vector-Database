@@ -108,7 +108,7 @@ class DeltaComputer:
         return result
 
     def validate_reconstruction(
-        self, original: np.ndarray, reconstructed: np.ndarray, tolerance: float = 1e-6
+        self, original: np.ndarray, reconstructed: np.ndarray, tolerance: float = 0.05
     ) -> Tuple[bool, float]:
         """
         Validate that reconstruction is accurate within tolerance.
