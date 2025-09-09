@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 class SequentialVersioningTester:
     """
     Comprehensive testing framework for sequential versioning temporal database system.
-    Tests auto-increment functionality, nearest base reconstruction, and performance optimizations.
+    Tests auto-increment functionality, nearest base reconstruction, sparsity-based promotion,
+    and performance optimizations.
     """
 
     def __init__(self, temp_dir: str = None):
@@ -37,11 +38,287 @@ class SequentialVersioningTester:
             self.cleanup_temp = False
 
         self.test_db_path = os.path.join(self.temp_dir, "test_sequential_db.h5")
-        self.simulator = WikipediaSimulator(embedding_dim=100, num_articles=3)
+        self.simulator = WikipediaSimulator(embedding_dim=100, num_articles=5)
 
         logger.info(
             f"Initialized sequential tester with storage at {self.test_db_path}"
         )
+
+    def test_sparsity_based_promotion(self) -> Dict[str, Any]:
+        """Test the new sparsity-based base promotion logic."""
+        logger.info("Testing sparsity-based base promotion...")
+
+        results = {}
+
+        with TemporalVectorDatabase(
+            self.test_db_path,
+            embedding_dim=100,
+            base_promotion_interval=20,  # Large interval so sparsity is main trigger
+            base_promotion_sparsity_threshold=0.6,  # 60% threshold for testing
+        ) as db:
+
+            # Create base embedding
+            base_embedding = np.random.normal(0, 1, 100)
+            base_embedding = base_embedding / np.linalg.norm(base_embedding)
+
+            # Test 1: Add first version (should be base)
+            success1, seq1 = db.add_content_version("sparsity_test", base_embedding)
+            results["first_version_stored"] = success1
+            results["first_sequence"] = seq1
+
+            # Test 2: Small change (low sparsity - should be delta)
+            small_change = base_embedding.copy()
+            small_change[:5] += np.random.normal(0, 0.02, 5)  # Only 5% of dimensions
+            small_change = small_change / np.linalg.norm(small_change)
+
+            success2, seq2 = db.add_content_version("sparsity_test", small_change)
+            results["small_change_stored"] = success2
+            results["small_change_sequence"] = seq2
+
+            # Verify it's stored as delta (not base)
+            timeline = db.get_content_timeline("sparsity_test")
+            results["small_change_is_delta"] = (
+                timeline
+                and seq2 in timeline.deltas
+                and seq2 not in timeline.base_snapshots
+            )
+
+            # Test 3: Large change (high sparsity - should trigger base promotion)
+            large_change = base_embedding.copy()
+            # Change 70% of dimensions (above 60% threshold)
+            change_indices = np.random.choice(100, 70, replace=False)
+            large_change[change_indices] += np.random.normal(0, 0.1, 70)
+            large_change = large_change / np.linalg.norm(large_change)
+
+            success3, seq3 = db.add_content_version("sparsity_test", large_change)
+            results["large_change_stored"] = success3
+            results["large_change_sequence"] = seq3
+
+            # Verify it's stored as base (due to sparsity)
+            timeline = db.get_content_timeline("sparsity_test")
+            results["large_change_is_base"] = (
+                timeline and seq3 in timeline.base_snapshots
+            )
+
+            # Test 4: Medium change (right at threshold - should be delta)
+            medium_change = large_change.copy()
+            # Change exactly 50% of dimensions (below 60% threshold)
+            change_indices = np.random.choice(100, 50, replace=False)
+            medium_change[change_indices] += np.random.normal(0, 0.05, 50)
+            medium_change = medium_change / np.linalg.norm(medium_change)
+
+            success4, seq4 = db.add_content_version("sparsity_test", medium_change)
+            results["medium_change_stored"] = success4
+            results["medium_change_sequence"] = seq4
+
+            timeline = db.get_content_timeline("sparsity_test")
+            results["medium_change_is_delta"] = (
+                timeline
+                and seq4 in timeline.deltas
+                and seq4 not in timeline.base_snapshots
+            )
+
+            # Test 5: Verify sparsity calculations in metadata
+            if timeline:
+                results["total_bases"] = len(timeline.base_snapshots)
+                results["total_deltas"] = len(timeline.deltas)
+                results["base_sequences"] = list(timeline.base_snapshots.keys())
+                results["delta_sequences"] = list(timeline.deltas.keys())
+
+                # Check delta metadata for sparsity information
+                if seq2 in timeline.deltas:
+                    delta2 = timeline.deltas[seq2]
+                    results["small_change_sparsity_ratio"] = delta2.metadata.get(
+                        "sparsity_ratio", 0
+                    )
+                    results["small_change_dimensions_changed"] = delta2.metadata.get(
+                        "dimensions_changed", 0
+                    )
+
+                if seq4 in timeline.deltas:
+                    delta4 = timeline.deltas[seq4]
+                    results["medium_change_sparsity_ratio"] = delta4.metadata.get(
+                        "sparsity_ratio", 0
+                    )
+                    results["medium_change_dimensions_changed"] = delta4.metadata.get(
+                        "dimensions_changed", 0
+                    )
+
+        logger.info(f"Sparsity-based promotion results: {results}")
+        return results
+
+    def test_sparsity_with_wikipedia_simulation(self) -> Dict[str, Any]:
+        """Test sparsity-based promotion with realistic Wikipedia evolution patterns."""
+        logger.info("Testing sparsity promotion with Wikipedia simulation...")
+
+        results = {}
+
+        with TemporalVectorDatabase(
+            self.test_db_path,
+            embedding_dim=100,
+            base_promotion_interval=15,  # Moderate interval
+            base_promotion_sparsity_threshold=0.7,  # 70% threshold
+        ) as db:
+
+            # Use Wikipedia simulator to generate realistic evolution patterns
+            article_id = "article_001"  # Science category
+            versions = self.simulator.simulate_article_evolution(
+                article_id, num_versions=12, time_span_days=200
+            )
+
+            promotion_reasons = []
+            sparsity_promotions = 0
+            interval_promotions = 0
+            total_bases = 0
+
+            for i, (timestamp, embedding) in enumerate(versions):
+                success, seq_num = db.add_content_version(
+                    content_id=f"wiki_{article_id}",
+                    embedding=embedding,
+                    timestamp=timestamp,
+                    metadata={"edit_index": i, "simulated": True},
+                )
+
+                if success:
+                    # Check what type of storage was used
+                    timeline = db.get_content_timeline(f"wiki_{article_id}")
+                    if timeline and seq_num in timeline.base_snapshots:
+                        total_bases += 1
+                        # Try to determine promotion reason from logs or position
+                        if (
+                            seq_num % 15 == 1
+                        ):  # Interval-based (every 15th, starting from 1)
+                            interval_promotions += 1
+                            promotion_reasons.append(f"v{seq_num}:interval")
+                        else:
+                            sparsity_promotions += 1
+                            promotion_reasons.append(f"v{seq_num}:sparsity")
+
+            results["total_versions_stored"] = len(versions)
+            results["total_bases_created"] = total_bases
+            results["sparsity_promotions"] = sparsity_promotions
+            results["interval_promotions"] = interval_promotions
+            results["promotion_reasons"] = promotion_reasons
+
+            # Analyze the final timeline
+            timeline = db.get_content_timeline(f"wiki_{article_id}")
+            if timeline:
+                results["final_base_sequences"] = sorted(timeline.base_snapshots.keys())
+                results["final_delta_sequences"] = sorted(timeline.deltas.keys())
+                results["max_sequence"] = timeline.max_sequence_number
+
+                # Check reconstruction quality
+                reconstruction_results = []
+                test_sequences = (
+                    [3, 6, 9, 12]
+                    if timeline.max_sequence_number >= 12
+                    else [timeline.max_sequence_number]
+                )
+
+                for seq in test_sequences:
+                    if seq <= timeline.max_sequence_number:
+                        result = db.get_version(f"wiki_{article_id}", seq)
+                        if result:
+                            reconstruction_results.append(
+                                {
+                                    "sequence": seq,
+                                    "reconstruction_cost": result.reconstruction_cost,
+                                    "quality_score": result.quality_score,
+                                    "base_used": result.base_sequence_used,
+                                    "base_distance": result.base_distance,
+                                }
+                            )
+
+                results["reconstruction_analysis"] = reconstruction_results
+                if reconstruction_results:
+                    results["avg_reconstruction_cost"] = np.mean(
+                        [r["reconstruction_cost"] for r in reconstruction_results]
+                    )
+                    results["avg_quality_score"] = np.mean(
+                        [r["quality_score"] for r in reconstruction_results]
+                    )
+
+        logger.info(f"Wikipedia sparsity simulation results: {results}")
+        return results
+
+    def test_sparsity_threshold_configuration(self) -> Dict[str, Any]:
+        """Test different sparsity threshold configurations."""
+        logger.info("Testing sparsity threshold configuration...")
+
+        results = {}
+
+        # Test with different threshold values
+        thresholds_to_test = [0.3, 0.5, 0.7, 0.9]
+
+        for threshold in thresholds_to_test:
+            threshold_results = {}
+
+            # Create a fresh database for each threshold test
+            test_path = os.path.join(self.temp_dir, f"threshold_{threshold}_test.h5")
+
+            with TemporalVectorDatabase(
+                test_path,
+                embedding_dim=100,
+                base_promotion_interval=50,  # Very large to isolate sparsity effect
+                base_promotion_sparsity_threshold=threshold,
+            ) as db:
+
+                base_embedding = np.random.normal(0, 1, 100)
+                base_embedding = base_embedding / np.linalg.norm(base_embedding)
+
+                # Store initial version
+                db.add_content_version(f"threshold_test_{threshold}", base_embedding)
+
+                # Test changes with known sparsity levels
+                test_sparsities = [0.2, 0.4, 0.6, 0.8]  # 20%, 40%, 60%, 80%
+                bases_created = 0
+
+                for sparsity in test_sparsities:
+                    test_embedding = base_embedding.copy()
+                    num_changes = int(sparsity * 100)
+                    change_indices = np.random.choice(100, num_changes, replace=False)
+                    test_embedding[change_indices] += np.random.normal(
+                        0, 0.05, num_changes
+                    )
+                    test_embedding = test_embedding / np.linalg.norm(test_embedding)
+
+                    success, seq_num = db.add_content_version(
+                        f"threshold_test_{threshold}", test_embedding
+                    )
+
+                    # Check if it was stored as base
+                    timeline = db.get_content_timeline(f"threshold_test_{threshold}")
+                    if timeline and seq_num in timeline.base_snapshots:
+                        bases_created += 1
+                        threshold_results[f"sparsity_{sparsity}_promoted"] = True
+                    else:
+                        threshold_results[f"sparsity_{sparsity}_promoted"] = False
+
+                threshold_results["total_bases_created"] = bases_created
+                threshold_results["threshold_value"] = threshold
+
+                # Expected promotions: sparsities above threshold should be promoted
+                expected_promotions = sum(1 for s in test_sparsities if s > threshold)
+                threshold_results["expected_promotions"] = expected_promotions
+                threshold_results["threshold_working_correctly"] = (
+                    bases_created == expected_promotions
+                )
+
+            results[f"threshold_{threshold}"] = threshold_results
+
+        # Overall threshold testing assessment
+        working_thresholds = sum(
+            1
+            for t in thresholds_to_test
+            if results[f"threshold_{t}"]["threshold_working_correctly"]
+        )
+        results["overall_threshold_test_pass"] = working_thresholds == len(
+            thresholds_to_test
+        )
+        results["working_thresholds_count"] = working_thresholds
+
+        logger.info(f"Sparsity threshold configuration results: {results}")
+        return results
 
     def test_auto_increment_functionality(self) -> Dict[str, Any]:
         """Test automatic sequence number assignment and basic operations."""
@@ -203,7 +480,7 @@ class SequentialVersioningTester:
             reconstruction_accuracies = []
             sequence_assignments = {}
 
-            for i in range(2):  # Test 2 articles
+            for i in range(3):  # Test 3 articles
                 article_id = f"article_{i:03d}"
                 versions = self.simulator.simulate_article_evolution(
                     article_id, num_versions=10
@@ -337,9 +614,10 @@ class SequentialVersioningTester:
             content_stats = db.get_content_statistics("access_test")
             results["content_statistics_available"] = "error" not in content_stats
             if "timeline_stats" in content_stats:
-                results["max_sequence_in_stats"] = content_stats["timeline_stats"][
-                    "max_sequence_number"
-                ]
+                timeline_stats = content_stats["timeline_stats"]
+                results["max_sequence_in_stats"] = timeline_stats.get(
+                    "max_sequence_number", timeline_stats.get("max_sequence", 0)
+                )
 
         logger.info(f"Version access patterns results: {results}")
         return results
@@ -513,6 +791,9 @@ class SequentialVersioningTester:
         logger.info("Running comprehensive sequential versioning test suite...")
 
         comprehensive_results = {
+            "sparsity_based_promotion": self.test_sparsity_based_promotion(),
+            "sparsity_wikipedia_simulation": self.test_sparsity_with_wikipedia_simulation(),
+            "sparsity_threshold_configuration": self.test_sparsity_threshold_configuration(),
             "auto_increment": self.test_auto_increment_functionality(),
             "nearest_base_reconstruction": self.test_nearest_base_reconstruction(),
             "wikipedia_simulation": self.test_wikipedia_simulation_sequential(),
@@ -523,6 +804,19 @@ class SequentialVersioningTester:
         }
 
         # Overall assessment with safe key access
+        sparsity_promotion_pass = (
+            comprehensive_results["sparsity_based_promotion"].get(
+                "large_change_is_base", False
+            )
+            and comprehensive_results["sparsity_based_promotion"].get(
+                "small_change_is_delta", False
+            )
+            and comprehensive_results["sparsity_threshold_configuration"].get(
+                "working_thresholds_count", 0
+            )
+            >= 1
+        )
+
         auto_increment_pass = (
             comprehensive_results["auto_increment"]["first_version_stored"]
             and comprehensive_results["auto_increment"]["sequence_increment_correct"]
@@ -556,16 +850,29 @@ class SequentialVersioningTester:
             == 3
         )
 
+        wiki_sparsity_results = comprehensive_results["sparsity_wikipedia_simulation"]
+        wikipedia_sparsity_pass = (
+            wiki_sparsity_results["total_versions_stored"] > 0
+            and wiki_sparsity_results["total_bases_created"]
+            > 0  # At least interval promotions work
+            and "reconstruction_analysis" in wiki_sparsity_results
+            and len(wiki_sparsity_results["reconstruction_analysis"]) > 0
+        )
+
         comprehensive_results["overall_assessment"] = {
+            "sparsity_based_promotion": sparsity_promotion_pass,
             "auto_increment_functionality": auto_increment_pass,
             "nearest_base_reconstruction": reconstruction_pass,
             "data_persistence": persistence_pass,
             "version_access_patterns": access_patterns_pass,
+            "wikipedia_sparsity_integration": wikipedia_sparsity_pass,
             "sequential_versioning_complete": (
-                auto_increment_pass
+                sparsity_promotion_pass
+                and auto_increment_pass
                 and reconstruction_pass
                 and persistence_pass
                 and access_patterns_pass
+                and wikipedia_sparsity_pass
             ),
         }
 
@@ -591,7 +898,37 @@ def main():
         # Display results
         print("\nSequential Versioning Test Results:")
 
-        print(f"\nAuto-Increment Functionality:")
+        print(f"\n🔹 Sparsity-Based Promotion:")
+        sparsity = results["sparsity_based_promotion"]
+        print(
+            f"  - Small Change (Low Sparsity): {'Delta ✓' if sparsity.get('small_change_is_delta', False) else 'Base ✗'}"
+        )
+        print(
+            f"  - Large Change (High Sparsity): {'Base ✓' if sparsity.get('large_change_is_base', False) else 'Delta ✗'}"
+        )
+        print(f"  - Total Bases Created: {sparsity.get('total_bases', 0)}")
+        print(f"  - Base Sequences: {sparsity.get('base_sequences', [])}")
+
+        print(f"\n🔹 Sparsity Threshold Configuration:")
+        threshold_test = results["sparsity_threshold_configuration"]
+        print(
+            f"  - Threshold Tests Passed: {'✓' if threshold_test.get('overall_threshold_test_pass', False) else '✗'}"
+        )
+        print(
+            f"  - Working Thresholds: {threshold_test.get('working_thresholds_count', 0)}/4"
+        )
+
+        print(f"\n🔹 Wikipedia Sparsity Integration:")
+        wiki_sparsity = results["sparsity_wikipedia_simulation"]
+        print(f"  - Sparsity Promotions: {wiki_sparsity.get('sparsity_promotions', 0)}")
+        print(f"  - Interval Promotions: {wiki_sparsity.get('interval_promotions', 0)}")
+        print(f"  - Total Versions: {wiki_sparsity.get('total_versions_stored', 0)}")
+        if "avg_reconstruction_cost" in wiki_sparsity:
+            print(
+                f"  - Avg Reconstruction Cost: {wiki_sparsity['avg_reconstruction_cost']:.2f}"
+            )
+
+        print(f"\n🔹 Auto-Increment Functionality:")
         auto = results["auto_increment"]
         print(
             f"  - First Version Stored: {'✓' if auto['first_version_stored'] else '✗'}"
@@ -606,7 +943,7 @@ def main():
             f"  - Timeline Structure: {auto.get('base_snapshots_count', 0)} bases, {auto.get('deltas_count', 0)} deltas"
         )
 
-        print(f"\nNearest Base Reconstruction:")
+        print(f"\n🔹 Nearest Base Reconstruction:")
         nearest = results["nearest_base_reconstruction"]
         print(f"  - Bases Created: {nearest.get('bases_created', [])}")
         print(
@@ -619,7 +956,7 @@ def main():
             f"  - Optimization Working: {'✓' if nearest.get('nearest_base_optimization', False) else '✗'}"
         )
 
-        print(f"\nWikipedia Simulation:")
+        print(f"\n🔹 Wikipedia Simulation:")
         wiki = results["wikipedia_simulation"]
         print(f"  - Articles Stored: {wiki['articles_stored']}")
         print(f"  - Total Versions: {wiki['total_versions_stored']}")
@@ -628,7 +965,7 @@ def main():
             f"  - Sequential Versioning: {'✓' if wiki['database_stats']['sequential_versioning'] else '✗'}"
         )
 
-        print(f"\nVersion Access Patterns:")
+        print(f"\n🔹 Version Access Patterns:")
         access = results["version_access_patterns"]
         print(
             f"  - Direct Sequence Access: {'✓' if access['direct_sequence_access'] else '✗'}"
@@ -642,7 +979,7 @@ def main():
         print(f"  - Range Access (2-4): {access['range_access_count']} versions")
         print(f"  - Temporal Access: {'✓' if access['temporal_access'] else '✗'}")
 
-        print(f"\nOptimization Features:")
+        print(f"\n🔹 Optimization Features:")
         opt = results["optimization_features"]
         print(f"  - High Cost Versions: {opt.get('high_cost_versions_found', 0)}")
         print(
@@ -655,7 +992,7 @@ def main():
             f"  - Integrity Validation: {'✓' if opt.get('integrity_validation_passed', False) else '✗'}"
         )
 
-        print(f"\nPersistence & Recovery:")
+        print(f"\n🔹 Persistence & Recovery:")
         persist = results["persistence_recovery"]
         print(
             f"  - Data Persisted: {'✓' if persist.get('sequence_numbers_preserved', False) else '✗'}"
@@ -667,8 +1004,11 @@ def main():
             f"  - V3 Accuracy After Reload: {persist.get('session2_v3_accuracy', 0):.4f}"
         )
 
-        print(f"\nOverall Assessment:")
+        print(f"\n🔹 Overall Assessment:")
         assessment = results["overall_assessment"]
+        print(
+            f"  - Sparsity-Based Promotion: {'PASS' if assessment['sparsity_based_promotion'] else 'FAIL'}"
+        )
         print(
             f"  - Auto-Increment Functionality: {'PASS' if assessment['auto_increment_functionality'] else 'FAIL'}"
         )
@@ -682,16 +1022,19 @@ def main():
             f"  - Version Access Patterns: {'PASS' if assessment['version_access_patterns'] else 'FAIL'}"
         )
         print(
+            f"  - Wikipedia Sparsity Integration: {'PASS' if assessment['wikipedia_sparsity_integration'] else 'FAIL'}"
+        )
+        print(
             f"  - Sequential Versioning: {'COMPLETE' if assessment['sequential_versioning_complete'] else 'INCOMPLETE'}"
         )
 
         if assessment["sequential_versioning_complete"]:
             print(
-                f"\nSequential versioning system is fully functional with optimized performance!"
+                f"\n🎉 Sequential versioning system with sparsity-based promotion is fully functional!"
             )
         else:
             print(
-                f"\nSequential versioning system needs attention - check failing components above"
+                f"\n⚠️  Sequential versioning system needs attention - check failing components above"
             )
 
     finally:

@@ -28,6 +28,7 @@ class TemporalVectorDatabase:
         embedding_dim: int = 384,
         sparsity_threshold: float = 0.01,
         base_promotion_interval: int = 10,
+        base_promotion_sparsity_threshold: float = 0.7,
     ):
         """
         Initialize the temporal vector database with sequential versioning.
@@ -41,6 +42,7 @@ class TemporalVectorDatabase:
         self.storage_path = storage_path
         self.embedding_dim = embedding_dim
         self.base_promotion_interval = base_promotion_interval
+        self.base_promotion_sparsity_threshold = base_promotion_sparsity_threshold
 
         self.storage_engine = TemporalStorageEngine(storage_path, embedding_dim)
         self.delta_computer = DeltaComputer(sparsity_threshold=sparsity_threshold)
@@ -109,14 +111,10 @@ class TemporalVectorDatabase:
             metadata = {}
 
         clean_metadata = self._convert_numpy_types_in_metadata(metadata)
-
         next_sequence = int(self.storage_engine.get_next_sequence_number(content_id))
         timeline = self.storage_engine.get_content_timeline(content_id)
-        should_create_base = self._should_create_base_snapshot(
-            timeline, next_sequence, force_base_snapshot
-        )
 
-        if force_base_snapshot or should_create_base:
+        if force_base_snapshot or timeline is None or next_sequence == 1:
             snapshot = BaseSnapshot(
                 content_id=content_id,
                 sequence_number=next_sequence,
@@ -124,55 +122,43 @@ class TemporalVectorDatabase:
                 embedding=embedding,
                 metadata=clean_metadata,
             )
-
             success = self.storage_engine.store_base_snapshot(snapshot)
             if success:
                 logger.info(
-                    "Stored base snapshot: %s (sequence %d)",
-                    snapshot.version_id,
-                    next_sequence,
-                )
-                return success, next_sequence
-            else:
-                logger.warning(
-                    "Base snapshot creation failed for %s_v%d, attempting delta fallback",
+                    "Stored base snapshot for content_id=%s, sequence=%d",
                     content_id,
                     next_sequence,
                 )
-                if timeline is None or timeline.max_sequence_number == 0:
-                    logger.error(
-                        "Cannot create delta fallback for first version of %s",
-                        content_id,
-                    )
-                    return False, next_sequence
-
-        if timeline is None or timeline.max_sequence_number == 0:
-            snapshot = BaseSnapshot(
-                content_id=content_id,
-                sequence_number=next_sequence,
-                timestamp=timestamp,
-                embedding=embedding,
-                metadata=clean_metadata,
-            )
-
-            success = self.storage_engine.store_base_snapshot(snapshot)
-            if success:
-                logger.info(
-                    "Stored first version as base snapshot: %s (sequence %d)",
-                    snapshot.version_id,
-                    next_sequence,
-                )
-            return success, next_sequence
+                return success, next_sequence
 
         prev_sequence = next_sequence - 1
         prev_embedding = self._get_embedding_at_sequence(timeline, prev_sequence)
 
-        if prev_embedding is None:
-            logger.error(
-                "Cannot retrieve previous version %d for delta creation",
-                prev_sequence,
+        should_create_base = self._should_create_base_snapshot(
+            timeline=timeline,
+            sequence_number=next_sequence,
+            force_base=False,
+            previous_embedding=prev_embedding,
+            current_embedding=embedding,
+            sparsity_threshold=self.base_promotion_sparsity_threshold,
+        )
+
+        if prev_embedding is None or should_create_base:
+            snapshot = BaseSnapshot(
+                content_id=content_id,
+                sequence_number=next_sequence,
+                timestamp=timestamp,
+                embedding=embedding,
+                metadata=clean_metadata,
             )
-            return False, next_sequence
+            success = self.storage_engine.store_base_snapshot(snapshot)
+            if success:
+                logger.info(
+                    "Stored base snapshot for content_id=%s, sequence=%d",
+                    content_id,
+                    next_sequence,
+                )
+            return success, next_sequence
 
         delta = self.delta_computer.compute_delta(
             from_embedding=prev_embedding,
@@ -184,7 +170,6 @@ class TemporalVectorDatabase:
         )
 
         delta.metadata.update(clean_metadata)
-
         success = self.storage_engine.store_delta(delta)
         if success:
             logger.info(
@@ -362,7 +347,7 @@ class TemporalVectorDatabase:
                 if "deltas" in f:
                     content_ids.update(f["deltas"].keys())
         except Exception as e:
-            logger.error(f"Error listing content IDs: {e}")
+            logger.error("Error listing content IDs: %s", e)
 
         return sorted(list(content_ids))
 
@@ -371,14 +356,21 @@ class TemporalVectorDatabase:
         timeline: Optional[ContentTimeline],
         sequence_number: int,
         force_base: bool,
+        previous_embedding: Optional[np.ndarray] = None,
+        current_embedding: Optional[np.ndarray] = None,
+        sparsity_threshold: float = 0.7,
     ) -> bool:
         """
         Determine whether to create a base snapshot using sequential versioning logic.
+        Now includes sparsity-based promotion.
 
         Args:
             timeline: Existing content timeline (may be None for first version)
             sequence_number: Current sequence number
             force_base: Force base snapshot creation
+            previous_embedding: Previous version embedding (for sparsity analysis)
+            current_embedding: Current version embedding (for sparsity analysis)
+            sparsity_threshold: Promote to base if sparsity ratio exceeds this
 
         Returns:
             True if should create base snapshot, False for delta
@@ -390,12 +382,32 @@ class TemporalVectorDatabase:
             return True
 
         if (sequence_number - 1) % self.base_promotion_interval == 0:
+            logger.info("Base promotion due to interval: sequence %d", sequence_number)
             return True
 
-        # Need to check for the scenario
+        if previous_embedding is not None and current_embedding is not None:
+            delta = current_embedding - previous_embedding
+            changed_dims = np.sum(
+                np.abs(delta) >= self.delta_computer.sparsity_threshold
+            )
+            sparsity_ratio = changed_dims / len(delta)
+
+            if sparsity_ratio > sparsity_threshold:
+                logger.info(
+                    "Base promotion due to high sparsity: %.2f (threshold: %.2f) for sequence %d",
+                    sparsity_ratio,
+                    sparsity_threshold,
+                    sequence_number,
+                )
+                return True
+
         if timeline.base_snapshots:
             latest_base_seq = max(timeline.base_snapshots.keys())
-            if sequence_number - latest_base_seq > self.base_promotion_interval * 2:
+            gap = sequence_number - latest_base_seq
+            max_gap = self.base_promotion_interval * 2
+
+            if gap > max_gap:
+                logger.info("Base promotion due to large gap: %d > %d", gap, max_gap)
                 return True
 
         return False
@@ -413,6 +425,9 @@ class TemporalVectorDatabase:
         Returns:
             Embedding array or None if not accessible
         """
+        if sequence_number < 1:
+            return None
+
         if sequence_number in timeline.base_snapshots:
             return timeline.base_snapshots[sequence_number].embedding
 
